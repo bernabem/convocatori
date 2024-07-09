@@ -1,0 +1,165 @@
+import re
+import logging
+import time
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from apscheduler.schedulers.background import BackgroundScheduler
+from pytz import utc  # Importar pytz para manejar zonas horarias
+
+# Token del bot de Telegram
+TOKEN = '7490971215:AAF2iOTTy8O8EGcG0ypBNgjw2lSVIJfKLrg'
+
+# Configuración de logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def start(update: Update, context: CallbackContext) -> None:
+    update.message.reply_text('Hola! Usa el comando /convocatorias para ver las convocatorias actuales.')
+
+def fetch_section(driver, link_text):
+    try:
+        url = "https://oficinavirtual.cordoba.es:4443/seleccion/web-empleo/faces/empleo.jspx"
+        logger.info(f"Cargando URL: {url}")
+        driver.get(url)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CLASS_NAME, 'AFHeaderAlias')))
+        
+        # Esperar 2 segundos
+        time.sleep(2)
+        
+        # Encontrar y hacer clic en el enlace correspondiente
+        link = driver.find_element(By.LINK_TEXT, link_text)
+        link.click()
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CLASS_NAME, 'AFHeaderAlias')))
+        
+        logger.info(f"Página cargada correctamente: {driver.current_url}")
+        return driver.page_source, driver.current_url
+    except Exception as e:
+        logger.error(f"No se pudo cargar la página o sección: {str(e)}")
+        return "", ""
+
+def parse_html(html, driver, section_url):
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, 'html.parser')
+    convocatorias = []
+
+    h2_elements = soup.find_all('h2', class_='x20 AFSubheaderAlias')
+
+    for idx, h2 in enumerate(h2_elements):
+        convocatoria_text = f"*{escape_markdown(h2.text.strip(), version=2)}*"
+
+        try:
+            logger.info(f"Buscando el botón 'Tablón de anuncios' para la convocatoria: {h2.text.strip()}")
+
+            tablon_button_xpath = f"//h2[contains(text(), '{h2.text.strip()}')]/following::a[contains(text(), 'Tablón de anuncios')]"
+            tablon_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, tablon_button_xpath)))
+            driver.execute_script("arguments[0].scrollIntoView();", tablon_button)
+            
+            # Esperar 2 segundos
+            time.sleep(2)
+            
+            tablon_button.click()
+
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, 'x2n')))
+            anuncio_soup = BeautifulSoup(driver.page_source, 'html.parser')
+            info_elements = anuncio_soup.find_all('td', class_='x62')
+
+            if not info_elements:
+                no_entries_div = anuncio_soup.find('div', text=re.compile(r'No hay entradas registradas en el tablón de anuncios de esta oferta de empleo'))
+                if no_entries_div:
+                    convocatoria_text += "\nNo hay entradas registradas en el tablón de anuncios de esta oferta de empleo"
+            else:
+                for info in info_elements:
+                    convocatoria_text += f"\n{escape_markdown(info.text.strip(), version=2)}"
+
+            driver.get(section_url)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'h2.x20.AFSubheaderAlias')))
+            
+            # Esperar 2 segundos
+            time.sleep(2)
+            
+        except Exception as e:
+            logger.warning(f"Error procesando la convocatoria: {h2.text.strip()}, Error: {str(e)}")
+
+        convocatorias.append(convocatoria_text)
+
+    return convocatorias
+
+def escape_markdown(text, version=1):
+    escape_chars = r'\_*[]()~`>#+-=|{}!.'
+    if version == 2:
+        escape_chars = r'\_*[]()~`>#+-=|{}!.'
+    return re.sub(r'([{}])'.format(re.escape(escape_chars)), r'\\\1', text)
+
+def send_long_message(update, messages):
+    for message in messages:
+        message_parts = [message[i:i + 4096] for i in range(0, len(message), 4096)]
+        for part in message_parts:
+            update.message.reply_text(part, parse_mode='MarkdownV2')
+
+def convocatorias(update: Update, context: CallbackContext) -> None:
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--no-sandbox')
+
+    with webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options) as driver:
+        driver.set_window_size(1920, 1080)
+
+        sections = ["En plazo de admisión", "Cerrado plazo de admisión", "Próximas convocatorias"]
+        convocatorias_completas = []
+
+        for section in sections:
+            html_content, page_url = fetch_section(driver, section)
+            convocatorias_list = parse_html(html_content, driver, page_url)
+            convocatorias_completas.append(f"{section}:\n" + "\n".join(convocatorias_list))
+
+    convocatorias_text = "\n\n".join(convocatorias_completas)
+
+    if convocatorias_text.strip():
+        send_long_message(update, convocatorias_completas)
+    else:
+        update.message.reply_text("No se encontraron convocatorias.")
+
+def check_website_structure():
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--no-sandbox')
+
+    with webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options) as driver:
+        driver.set_window_size(1920, 1080)
+        url = "https://oficinavirtual.cordoba.es:4443/seleccion/web-empleo/faces/empleo.jspx"
+        driver.get(url)
+        try:
+            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CLASS_NAME, 'AFHeaderAlias')))
+            logger.info("La estructura de la página web no ha cambiado.")
+        except Exception as e:
+            logger.error(f"Posible cambio en la estructura de la página web: {str(e)}")
+
+def main() -> None:
+    updater = Updater(TOKEN)
+
+    dispatcher = updater.dispatcher
+
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("convocatorias", convocatorias))
+
+    # Programar la verificación de la estructura del sitio web cada 24 horas
+    scheduler = BackgroundScheduler(timezone=utc)
+    scheduler.add_job(check_website_structure, 'interval', hours=24)
+    scheduler.start()
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
